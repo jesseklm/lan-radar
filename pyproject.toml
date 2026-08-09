@@ -1,0 +1,10 @@
+[project]
+name = "lan-radar"
+version = "0.0.1"
+requires-python = ">=3.13"
+dependencies = [
+    "aiosqlite==0.22.1",
+    "mac-vendor-lookup==0.1.15",
+    "nicegui==3.15.0",
+    "scapy==2.7.0",
+]
