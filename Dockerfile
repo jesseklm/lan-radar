@@ -13,9 +13,6 @@ RUN uv sync --locked
 FROM python:3.14-alpine
 COPY --from=builder /app /app
 RUN apk add --no-cache libpcap
-ARG BUILD_VERSION=0.0.1
-ARG BUILD_ARCH=amd64
-LABEL io.hass.version="${BUILD_VERSION}" io.hass.type="app" io.hass.arch="${BUILD_ARCH}"
 ENV PATH="/app/.venv/bin:$PATH"
 WORKDIR /data
 EXPOSE 8099
