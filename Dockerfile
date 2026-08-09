@@ -15,5 +15,4 @@ COPY --from=builder /app /app
 RUN apk add --no-cache libpcap-dev binutils
 ENV PATH="/app/.venv/bin:$PATH"
 WORKDIR /data
-EXPOSE 8099
 CMD ["python", "/app/lan_radar.py"]

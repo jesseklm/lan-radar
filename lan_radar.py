@@ -1,8 +1,10 @@
 import asyncio
 import inspect
 import ipaddress
+import json
 import os
 import socket
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,15 @@ class HomeAssistantIngressMiddleware:
         headers.append((b"x-forwarded-prefix", ingress_path.rstrip(b"/")))
         scope["headers"] = headers
         await self.application(scope, receive, send)
+
+
+def get_ingress_port() -> int:
+    token = os.environ["SUPERVISOR_TOKEN"]
+    request = urllib.request.Request("http://supervisor/addons/self/info",
+                                     headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(request) as response:
+        result = json.load(response)
+    return result["data"]["ingress_port"]
 
 
 def get_network_interface() -> str:
@@ -375,6 +386,10 @@ if __name__ == "__main__":
     app.on_startup(lan_radar.run)
     app.on_shutdown(database.close)
     app.add_middleware(HomeAssistantIngressMiddleware, enabled=HOME_ASSISTANT_INGRESS)
-    host = "0.0.0.0" if HOME_ASSISTANT_INGRESS else "127.0.0.1"
-    port = 8099 if HOME_ASSISTANT_INGRESS else 8080
+    if HOME_ASSISTANT_INGRESS:
+        host = "0.0.0.0"
+        port = get_ingress_port()
+    else:
+        host = "127.0.0.1"
+        port = 8080
     ui.run(host=host, port=port, title="LAN-Radar", dark=True, language="en-US", show=False, reload=False)
