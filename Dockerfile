@@ -12,7 +12,7 @@ RUN uv sync --locked
 
 FROM python:3.14-alpine
 COPY --from=builder /app /app
-RUN apk add --no-cache libpcap-dev
+RUN apk add --no-cache libpcap-dev binutils
 ENV PATH="/app/.venv/bin:$PATH"
 WORKDIR /data
 EXPOSE 8099
