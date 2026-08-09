@@ -51,6 +51,35 @@ class HomeAssistantIngressMiddleware:
         await self.application(scope, receive, send)
 
 
+def get_network_interface() -> str:
+    conf.route.resync()
+    default_interface, default_address, _ = conf.route.route()
+    try:
+        address = ipaddress.IPv4Address(default_address)
+        if not address.is_unspecified and not address.is_loopback and not address.is_link_local:
+            return network_name(default_interface)
+    except ValueError:
+        pass
+
+    candidates = []
+    for net, mask, gateway, interface, route_address, metric in conf.route.routes:
+        try:
+            address = ipaddress.IPv4Address(route_address)
+            network = ipaddress.IPv4Network(f"{ipaddress.IPv4Address(net)}/{ipaddress.IPv4Address(mask)}")
+            interface = network_name(interface)
+        except ValueError:
+            continue
+        if net == 0 or mask in {0, 0xffffffff} or address not in network:
+            continue
+        if address.is_unspecified or address.is_loopback or address.is_link_local:
+            continue
+        candidates.append((not address.is_private, gateway != "0.0.0.0", metric, -network.prefixlen, interface))
+
+    if not candidates:
+        raise RuntimeError("no active IPv4 network interface found")
+    return min(candidates)[-1]
+
+
 def get_subnet(iface: str) -> str:
     iface = network_name(iface)
     ip = ipaddress.IPv4Address(get_if_addr(iface))
@@ -80,12 +109,13 @@ async def resolve_hostname(ip: str) -> str | None:
 
 
 class LanRadar:
-    def __init__(self, iface: str):
-        self.iface = iface
-        self.subnet = get_subnet(iface)
+    def __init__(self, iface: str | None = None):
+        self.iface = network_name(iface) if iface else get_network_interface()
+        self.subnet = get_subnet(self.iface)
         self.queue = asyncio.Queue()
         self.loop = None
         self.sniffer = None
+        print(f"Using network interface {self.iface} with subnet {self.subnet}")
 
     def packet_received(self, packet):
         self.loop.call_soon_threadsafe(self.queue.put_nowait, packet)
@@ -264,7 +294,7 @@ async def index():
 if __name__ == "__main__":
     mac = AsyncMacLookup()
     BaseMacLookup.cache_path = str(Path(__file__).parent.resolve() / "mac-vendors.txt")
-    lan_radar = LanRadar("enp6s0")
+    lan_radar = LanRadar()
     app.on_startup(database.connect)
     app.on_startup(lan_radar.run)
     app.on_shutdown(database.close)
