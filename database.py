@@ -3,7 +3,6 @@ import ipaddress
 import time
 from collections import defaultdict
 from contextlib import suppress
-from datetime import datetime
 
 import aiosqlite
 
@@ -44,10 +43,15 @@ class Database:
             CREATE TABLE IF NOT EXISTS devices (
                 mac TEXT PRIMARY KEY COLLATE NOCASE,
                 vendor TEXT,
+                note TEXT,
                 first_seen INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL
             )
         """)
+
+        cursor = await self.db.execute("PRAGMA table_info(devices)")
+        if "note" not in {row["name"] for row in await cursor.fetchall()}:
+            await self.db.execute("ALTER TABLE devices ADD COLUMN note TEXT")
 
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS device_ips (
@@ -113,6 +117,7 @@ class Database:
             SELECT
                 mac,
                 vendor,
+                note,
                 first_seen,
                 last_seen
             FROM devices
@@ -229,8 +234,9 @@ class Database:
                 "hostname_count": len(hostnames),
                 "hostnames": ", ".join(all_hostnames) if all_hostnames else None,
                 "vendor": device["vendor"],
-                "first_seen": datetime.fromtimestamp(device["first_seen"]).astimezone(),
-                "last_seen": datetime.fromtimestamp(device["last_seen"]).astimezone(),
+                "note": device["note"],
+                "first_seen": device["first_seen"],
+                "last_seen": device["last_seen"],
             })
 
         return devices
@@ -246,6 +252,9 @@ class Database:
             })
 
         return result
+
+    async def get_device_macs(self):
+        return sorted(self.devices)
 
     async def get_device_by_mac(self, mac: str):
         mac = mac.strip().lower()
@@ -266,6 +275,29 @@ class Database:
                      if entry["device_mac"] == mac]
 
         return ", ".join(sorted(hostnames)) if hostnames else None
+
+    async def set_device_note(self, mac: str, note: str | None):
+        mac = mac.strip().lower()
+        note = note.strip() if note and note.strip() else None
+        device = self.devices.get(mac)
+        if not device or device["note"] == note:
+            return False
+
+        device["note"] = note
+        self.dirty_devices.add(mac)
+        await self.flush()
+        return True
+
+    async def update_device_vendor(self, mac: str, vendor: str | None):
+        mac = mac.strip().lower()
+        vendor = vendor.strip() if vendor else None
+        device = self.devices.get(mac)
+        if not device or not vendor or device["vendor"] == vendor:
+            return False
+
+        device["vendor"] = vendor
+        self.dirty_devices.add(mac)
+        return True
 
     async def upsert_device(self, mac: str, ip: str | None, vendor: str | None):
         mac = mac.strip().lower()
@@ -292,7 +324,7 @@ class Database:
             device["last_seen"] = now
 
         else:
-            device = {"mac": mac, "vendor": vendor, "first_seen": now, "last_seen": now}
+            device = {"mac": mac, "vendor": vendor, "note": None, "first_seen": now, "last_seen": now}
 
             self.devices[mac] = device
 
@@ -400,16 +432,18 @@ class Database:
                         INSERT INTO devices (
                             mac,
                             vendor,
+                            note,
                             first_seen,
                             last_seen
                         )
-                        VALUES (?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?)
 
                         ON CONFLICT(mac) DO UPDATE SET
                             vendor = excluded.vendor,
+                            note = excluded.note,
                             last_seen = excluded.last_seen
                     """, [
-                        (device["mac"], device["vendor"], device["first_seen"], device["last_seen"])
+                        (device["mac"], device["vendor"], device["note"], device["first_seen"], device["last_seen"])
                         for device in devices
                     ])
 

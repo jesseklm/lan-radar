@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from mac_vendor_lookup import AsyncMacLookup, BaseMacLookup
-from nicegui import ui, app, run
+from nicegui import app, run, ui
 from scapy.arch import get_if_addr
 from scapy.config import conf
 from scapy.interfaces import network_name
-from scapy.layers.dhcp import DHCP, BOOTP
+from scapy.layers.dhcp import BOOTP, DHCP
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import ARP, Ether
@@ -19,7 +19,6 @@ from scapy.sendrecv import AsyncSniffer, send, sendp
 from starlette.responses import PlainTextResponse
 
 from database import database
-
 
 HOME_ASSISTANT_INGRESS = os.getenv("HOME_ASSISTANT_INGRESS", "").lower() in {"1", "true", "yes"}
 HOME_ASSISTANT_INGRESS_PROXY = "172.30.32.2"
@@ -98,10 +97,18 @@ def get_subnet(iface: str) -> str:
 
 def resolve_hostname_sync(ip: str) -> str | None:
     try:
-        hostname, aliases, addresses = socket.gethostbyaddr(ip)
-        return hostname
+        hostname, _, _ = socket.gethostbyaddr(ip)
     except (socket.herror, socket.gaierror):
         return None
+
+    hostname = hostname.strip().rstrip(".")
+    if not hostname:
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return hostname
+    return None
 
 
 async def resolve_hostname(ip: str) -> str | None:
@@ -148,6 +155,17 @@ class LanRadar:
             return await mac.lookup(mac_addr)
         except KeyError:
             return None
+
+    async def update_vendors(self):
+        await mac.update_vendors()
+        updated = 0
+        for mac_addr in await database.get_device_macs():
+            vendor = await self.lookup_vendor(mac_addr)
+            if await database.update_device_vendor(mac_addr, vendor):
+                updated += 1
+        if updated:
+            await database.flush()
+        return updated
 
     async def process_arp(self, arp: ARP):
         vendor = await self.lookup_vendor(arp.hwsrc)
@@ -225,20 +243,41 @@ class LanRadar:
 
 @ui.page("/")
 async def index():
+    async def reload_rows():
+        table.rows = await database.get_devices()
+
+    async def update_vendors():
+        updated = await lan_radar.update_vendors()
+        await reload_rows()
+        noun = "vendor" if updated == 1 else "vendors"
+        return f"Vendor list updated; {updated} device {noun} changed"
+
+    async def save_note(event):
+        try:
+            changed = await database.set_device_note(event.args["mac"], event.args.get("note"))
+        except Exception as exc:
+            print("Saving note failed:", exc)
+            ui.notify(f"Saving note failed: {exc}", type="negative", multi_line=True, position="bottom-right")
+        else:
+            if changed:
+                ui.notify("Note saved", type="positive", position="bottom-right")
+
     async def run_action(label, action):
         ui.notify(f"{label} started", type="info", position="bottom-right")
         try:
             result = action()
             if inspect.isawaitable(result):
-                await result
+                result = await result
         except Exception as exc:
             print(f"{label} failed:", exc)
             ui.notify(f"{label} failed: {exc}", type="negative", multi_line=True, position="bottom-right")
         else:
-            ui.notify(f"{label} completed", type="positive", position="bottom-right")
+            message = result if isinstance(result, str) else f"{label} completed"
+            ui.notify(message, type="positive", position="bottom-right")
 
     columns: list[dict[str, Any]] = [{"name": "mac"}, {"name": "ip"}, {"name": "hostname"},
-                                    {"name": "vendor"}, {"name": "first_seen"}, {"name": "last_seen"}]
+                                     {"name": "vendor"}, {"name": "note"}, {"name": "first_seen"},
+                                     {"name": "last_seen"}]
     for column in columns:
         if "field" not in column: column["field"] = column["name"]
         if "label" not in column: column["label"] = column["name"]
@@ -285,15 +324,52 @@ async def index():
             </div>
         </q-td>
     """)
+    table.add_slot("body-cell-note", """
+        <q-td :props="props" style="max-width: 260px">
+            <div class="row items-center no-wrap cursor-pointer">
+                <span class="ellipsis" :class="{'text-grey-5': !props.row.note}">
+                    {{ props.row.note || 'Add note...' }}
+                </span>
+                <q-icon name="edit" size="xs" class="q-ml-xs text-grey-5" />
+            </div>
+            <q-popup-edit
+                v-model="props.row.note"
+                v-slot="scope"
+                buttons
+                label-set="Save"
+                label-cancel="Cancel"
+                @save="$parent.$emit('note-change', {mac: props.row.mac, note: $event})"
+            >
+                <q-input v-model="scope.value" type="textarea" autogrow autofocus dense style="min-width: 300px" />
+            </q-popup-edit>
+        </q-td>
+    """)
+    table.on("note-change", save_note)
+    timestamp_slot = """
+        <q-td :props="props">
+            {{ props.value
+                ? new Date(props.value * 1000).toLocaleString('de-DE', {
+                    day: '2-digit', month: '2-digit', year: '2-digit',
+                    hour: '2-digit', minute: '2-digit', hour12: false,
+                }).replace(',', '')
+                : '-'
+            }}
+        </q-td>
+    """
+    table.add_slot("body-cell-first_seen", timestamp_slot)
+    table.add_slot("body-cell-last_seen", timestamp_slot)
     with table.add_slot("top-right"):
+        ui.input(placeholder='search...').bind_value(table, 'filter').props('flat dense')
+        ui.button('macs', on_click=lambda: run_action('MAC update vendors', update_vendors)).props('flat dense')
         ui.button('mdns', on_click=lambda: run_action('mDNS', lan_radar.send_mdns_discovery)).props('flat dense')
         ui.button('rdns', on_click=lambda: run_action('Reverse DNS', lan_radar.reverse_dns_lookup)).props('flat dense')
         ui.button('arp', on_click=lambda: run_action('ARP', lan_radar.send_arp_discovery)).props('flat dense')
+        ui.button(icon='refresh', on_click=lambda: run_action('Refresh', reload_rows)).props('flat dense')
 
 
 if __name__ == "__main__":
     mac = AsyncMacLookup()
-    BaseMacLookup.cache_path = str(Path(__file__).parent.resolve() / "mac-vendors.txt")
+    BaseMacLookup.cache_path = str(Path.cwd() / "mac-vendors.txt")
     lan_radar = LanRadar()
     app.on_startup(database.connect)
     app.on_startup(lan_radar.run)
