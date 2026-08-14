@@ -84,6 +84,13 @@ class Database:
             )
         """)
 
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
         await self.db.commit()
         await self.load_cache()
 
@@ -222,7 +229,7 @@ class Database:
             latest_ip = ip_entries[0] if ip_entries else None
             hostnames = [entry for entry in self.device_hostnames.values() if entry["device_mac"] == device["mac"]]
 
-            all_hostnames = sorted(f'{entry["hostname"]} [{entry["source"]}]' for entry in hostnames)
+            all_hostnames = sorted(f"{entry['hostname']} [{entry['source']}]" for entry in hostnames)
             all_ips = [str(ipaddress.ip_address(entry["ip_packed"])) for entry in ip_entries]
 
             devices.append({
@@ -271,10 +278,28 @@ class Database:
     async def get_device_hostname_by_mac(self, mac: str):
         mac = mac.strip().lower()
 
-        hostnames = [f'{entry["hostname"]} [{entry["source"]}]' for entry in self.device_hostnames.values()
+        hostnames = [f"{entry['hostname']} [{entry['source']}]" for entry in self.device_hostnames.values()
                      if entry["device_mac"] == mac]
 
         return ", ".join(sorted(hostnames)) if hostnames else None
+
+    async def get_config(self, key: str, default: str | None = None):
+        cursor = await self.db.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row["value"] if row else default
+
+    async def set_config(self, values: dict[str, str]):
+        async with self.flush_lock:
+            try:
+                await self.db.executemany("""
+                    INSERT INTO config (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """, values.items())
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def set_device_note(self, mac: str, note: str | None):
         mac = mac.strip().lower()
@@ -286,6 +311,30 @@ class Database:
         device["note"] = note
         self.dirty_devices.add(mac)
         await self.flush()
+        return True
+
+    async def delete_device(self, mac: str):
+        mac = mac.strip().lower()
+        if mac not in self.devices:
+            return False
+        async with self.flush_lock:
+            try:
+                await self.db.execute("DELETE FROM devices WHERE mac = ?", (mac,))
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+            self.devices.pop(mac, None)
+            self.dirty_devices.discard(mac)
+            ip_keys = [key for key, entry in self.device_ips.items() if entry["device_mac"] == mac]
+            for key in ip_keys:
+                entry = self.device_ips.pop(key)
+                self._remove_ip_index(entry)
+                self.dirty_ips.discard(key)
+            hostname_keys = [key for key, entry in self.device_hostnames.items() if entry["device_mac"] == mac]
+            for key in hostname_keys:
+                self.device_hostnames.pop(key)
+                self.dirty_hostnames.discard(key)
         return True
 
     async def update_device_vendor(self, mac: str, vendor: str | None):
@@ -316,6 +365,7 @@ class Database:
                 ip_version = address.version
 
         device = self.devices.get(mac)
+        is_new = device is None
 
         if device:
             if vendor:
@@ -339,8 +389,11 @@ class Database:
                 entry["last_seen"] = now
             else:
                 entry = {
-                    "device_mac": mac, "ip_packed": ip_packed, "ip_version": ip_version,
-                    "first_seen": now, "last_seen": now,
+                    "device_mac": mac,
+                    "ip_packed": ip_packed,
+                    "ip_version": ip_version,
+                    "first_seen": now,
+                    "last_seen": now,
                 }
                 self.device_ips[key] = entry
 
@@ -351,6 +404,8 @@ class Database:
                 if old_latest_ip:
                     self._remove_ip_index(old_latest_ip)
                 self._add_ip_index(new_latest_ip)
+
+        return is_new
 
     async def add_hostname_of_mac(self, mac: str, hostname: str | None, source: str):
         if not hostname:
@@ -372,7 +427,11 @@ class Database:
             entry["last_seen"] = now
         else:
             self.device_hostnames[key] = {
-                "device_mac": mac, "hostname": hostname, "source": source, "first_seen": now, "last_seen": now,
+                "device_mac": mac,
+                "hostname": hostname,
+                "source": source,
+                "first_seen": now,
+                "last_seen": now,
             }
 
         self.dirty_hostnames.add(key)
@@ -460,10 +519,13 @@ class Database:
 
                         ON CONFLICT(device_mac, ip_version, ip_packed) DO UPDATE SET
                             last_seen = excluded.last_seen
-                    """, [
-                        (entry["device_mac"], entry["ip_packed"], entry["ip_version"], entry["first_seen"],
-                         entry["last_seen"])
-                        for entry in ips
+                    """, [(
+                        entry["device_mac"],
+                        entry["ip_packed"],
+                        entry["ip_version"],
+                        entry["first_seen"],
+                        entry["last_seen"],
+                    ) for entry in ips
                     ])
 
                 if hostnames:
@@ -479,10 +541,13 @@ class Database:
 
                         ON CONFLICT(device_mac, hostname, source) DO UPDATE SET
                             last_seen = excluded.last_seen
-                    """, [
-                        (entry["device_mac"], entry["hostname"], entry["source"], entry["first_seen"],
-                         entry["last_seen"])
-                        for entry in hostnames
+                    """, [(
+                        entry["device_mac"],
+                        entry["hostname"],
+                        entry["source"],
+                        entry["first_seen"],
+                        entry["last_seen"],
+                    ) for entry in hostnames
                     ])
 
                 await self.db.commit()
