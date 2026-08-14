@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import logging
 import time
 from collections import defaultdict
 from contextlib import suppress
@@ -460,8 +461,8 @@ class Database:
 
             try:
                 await self.flush()
-            except Exception as exc:
-                print("Database flush failed:", exc)
+            except Exception:
+                logging.exception("Database flush failed")
 
     async def flush(self):
         if not self.db:
@@ -553,7 +554,9 @@ class Database:
                 await self.db.commit()
 
                 if devices or ips or hostnames:
-                    print(f"DB flush: {len(devices)} devices, {len(ips)} IPs, {len(hostnames)} hostnames")
+                    logging.info(
+                        "DB flush: %d devices, %d IPs, %d hostnames", len(devices), len(ips), len(hostnames)
+                    )
 
             except Exception:
                 await self.db.rollback()

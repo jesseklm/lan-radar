@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import ipaddress
 import json
+import logging
 import os
 import socket
 import time
@@ -153,7 +154,7 @@ class LanRadar:
         self.apprise_urls = ""
         self.notifier = apprise.Apprise()
         self.notification_tasks = set()
-        print(f"Using network interface {self.iface} with subnet {self.subnet}")
+        logging.info("Using network interface %s with subnet %s", self.iface, self.subnet)
 
     async def load_protocol_settings(self):
         for protocol, key in PROTOCOL_CONFIG_KEYS.items():
@@ -183,7 +184,7 @@ class LanRadar:
             self.notifier = self.create_notifier(self.apprise_urls)
         except ValueError as exc:
             self.new_device_notifications_enabled = False
-            print(f"Notifications disabled: {exc}")
+            logging.warning("Notifications disabled: %s", exc)
 
     def get_capture_filter(self) -> str | None:
         filters = [f"({PROTOCOL_FILTERS[protocol]})" for protocol, enabled in self.protocol_enabled.items() if enabled]
@@ -192,11 +193,11 @@ class LanRadar:
     def start_sniffer(self):
         capture_filter = self.get_capture_filter()
         if capture_filter is None:
-            print("Packet capture disabled")
+            logging.info("Packet capture disabled")
             return
         self.sniffer = AsyncSniffer(iface=self.iface, filter=capture_filter, store=False, prn=self.packet_received)
         self.sniffer.start()
-        print(f"Packet capture filter: {capture_filter}")
+        logging.info("Packet capture filter: %s", capture_filter)
 
     def stop_sniffer(self):
         sniffer = self.sniffer
@@ -270,11 +271,11 @@ class LanRadar:
             details.append(f"Vendor: {vendor}")
         try:
             result = await notifier.async_notify(title="New device on the LAN", body="\n".join(details))
-        except Exception as exc:
-            print(f"Apprise notification failed: {exc}")
+        except Exception:
+            logging.exception("Apprise notification failed")
         else:
             if result is not True:
-                print("Apprise notification could not be delivered")
+                logging.error("Apprise notification could not be delivered")
 
     def packet_received(self, packet):
         self.loop.call_soon_threadsafe(self.enqueue_packet, packet, time.monotonic())
@@ -372,16 +373,12 @@ class LanRadar:
             fqdn = fqdn[3:].decode(errors="ignore")
         if isinstance(vendor_class, bytes):
             vendor_class = vendor_class.decode(errors="ignore")
-        print(
-            "DHCP:",
+        logging.info(
+            "DHCP: %s hostname=%s requested_ip=%s vendor=%s server=%s yiaddr=%s ciaddr=%s mac=%s fqdn=%s",
             message_type,
-            "hostname=",
             hostname,
-            "requested_ip=",
             requested_ip,
-            "vendor=",
             vendor_class,
-            "server=",
             server_id,
             bootp.yiaddr,
             bootp.ciaddr,
@@ -476,7 +473,7 @@ async def index():
         try:
             changed = await database.set_device_note(event.args["mac"], event.args.get("note"))
         except Exception as exc:
-            print("Saving note failed:", exc)
+            logging.exception("Saving note failed")
             ui.notify(f"Saving note failed: {exc}", type="negative", multi_line=True)
         else:
             if changed:
@@ -496,7 +493,7 @@ async def index():
         try:
             deleted = await database.delete_device(mac)
         except Exception as exc:
-            print("Could not delete device:", exc)
+            logging.exception("Could not delete device")
             ui.notify(f"Could not delete device: {exc}", type="negative", multi_line=True)
         else:
             delete_device_dialog.close()
@@ -512,7 +509,7 @@ async def index():
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            print(f"{label} failed:", exc)
+            logging.exception("%s failed", label)
             ui.notify(f"{label} failed: {exc}", type="negative", multi_line=True)
         else:
             message = result if isinstance(result, str) else f"{label} completed"
@@ -542,7 +539,7 @@ async def index():
             try:
                 await database.set_config({TABLE_ROWS_PER_PAGE_CONFIG_KEY: str(new_rows_per_page)})
             except Exception as exc:
-                print("Could not save page size:", exc)
+                logging.exception("Could not save page size")
                 ui.notify(f"Could not save page size: {exc}", type="negative", multi_line=True)
             else:
                 rows_per_page = new_rows_per_page
@@ -711,7 +708,7 @@ async def index():
                 apprise_urls_input.value or "",
             )
         except Exception as exc:
-            print("Could not save settings:", exc)
+            logging.exception("Could not save settings")
             ui.notify(f"Could not save settings: {exc}", type="negative", multi_line=True)
         else:
             settings_dialog.close()
@@ -766,6 +763,8 @@ async def index():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    logging.info('Starting LAN Radar.')
     mac = AsyncMacLookup()
     BaseMacLookup.cache_path = str(Path.cwd() / "mac-vendors.txt")
     lan_radar = LanRadar()
@@ -785,12 +784,15 @@ if __name__ == "__main__":
     else:
         host = "127.0.0.1"
         port = 8080
-    ui.run(
-        host=host,
-        port=port,
-        title="LAN-Radar",
-        dark=True,
-        language="en-US",
-        show=False,
-        reload=False,
-    )
+    try:
+        ui.run(
+            host=host,
+            port=port,
+            title="LAN-Radar",
+            dark=True,
+            language="en-US",
+            show=False,
+            reload=False,
+        )
+    except KeyboardInterrupt:
+        logging.info('KeyboardInterrupt received. Stopping.')
