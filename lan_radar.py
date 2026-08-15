@@ -32,7 +32,15 @@ PACKET_COUNT_WINDOW_SECONDS = 60
 DEFAULT_TABLE_ROWS_PER_PAGE = 50
 TABLE_ROWS_PER_PAGE_CONFIG_KEY = "table.rows_per_page"
 NEW_DEVICE_NOTIFICATIONS_ENABLED_CONFIG_KEY = "notifications.new_devices.enabled"
+NOTIFICATION_NETWORK_NAME_CONFIG_KEY = "notifications.new_devices.network_name"
 APPRISE_URLS_CONFIG_KEY = "notifications.apprise.urls"
+DATE_TIME_FORMAT_CONFIG_KEY = "display.date_time_format"
+DEFAULT_NOTIFICATION_NETWORK_NAME = "the LAN"
+DEFAULT_DATE_TIME_FORMAT = "en-US"
+DATE_TIME_FORMATS = {
+    "en-US": "English (MM/DD/YY, 24-hour)",
+    "de-DE": "German (DD.MM.YY, 24-hour)",
+}
 PROTOCOL_FILTERS = {
     "dhcp": "udp port 67 or udp port 68",
     "arp": "arp",
@@ -151,7 +159,9 @@ class LanRadar:
         self.protocol_enabled = {protocol: True for protocol in PROTOCOL_FILTERS}
         self.packet_timestamps = {protocol: deque() for protocol in PROTOCOL_FILTERS}
         self.new_device_notifications_enabled = False
+        self.notification_network_name = DEFAULT_NOTIFICATION_NETWORK_NAME
         self.apprise_urls = ""
+        self.date_time_format = DEFAULT_DATE_TIME_FORMAT
         self.notifier = apprise.Apprise()
         self.notification_tasks = set()
         logging.info("Using network interface %s with subnet %s", self.iface, self.subnet)
@@ -176,6 +186,9 @@ class LanRadar:
 
     async def load_notification_settings(self):
         enabled = await database.get_config(NEW_DEVICE_NOTIFICATIONS_ENABLED_CONFIG_KEY, "false")
+        network_name = await database.get_config(NOTIFICATION_NETWORK_NAME_CONFIG_KEY,
+                                                 DEFAULT_NOTIFICATION_NETWORK_NAME)
+        self.notification_network_name = network_name.strip() or DEFAULT_NOTIFICATION_NETWORK_NAME
         self.apprise_urls = self.normalize_apprise_urls(await database.get_config(APPRISE_URLS_CONFIG_KEY, ""))
         self.new_device_notifications_enabled = enabled.lower() in {"1", "true", "yes", "on"}
         if not self.new_device_notifications_enabled:
@@ -185,6 +198,10 @@ class LanRadar:
         except ValueError as exc:
             self.new_device_notifications_enabled = False
             logging.warning("Notifications disabled: %s", exc)
+
+    async def load_display_settings(self):
+        date_time_format = await database.get_config(DATE_TIME_FORMAT_CONFIG_KEY, DEFAULT_DATE_TIME_FORMAT)
+        self.date_time_format = date_time_format if date_time_format in DATE_TIME_FORMATS else DEFAULT_DATE_TIME_FORMAT
 
     def get_capture_filter(self) -> str | None:
         filters = [f"({PROTOCOL_FILTERS[protocol]})" for protocol, enabled in self.protocol_enabled.items() if enabled]
@@ -210,10 +227,15 @@ class LanRadar:
             protocol_settings: dict[str, bool],
             notifications_enabled: bool,
             apprise_urls: str,
+            notification_network_name: str = DEFAULT_NOTIFICATION_NETWORK_NAME,
+            date_time_format: str = DEFAULT_DATE_TIME_FORMAT,
     ):
         new_protocol_settings = {protocol: bool(protocol_settings[protocol]) for protocol in PROTOCOL_FILTERS}
+        notification_network_name = notification_network_name.strip() or DEFAULT_NOTIFICATION_NETWORK_NAME
         normalized_urls = self.normalize_apprise_urls(apprise_urls)
         new_notifier = self.create_notifier(normalized_urls) if notifications_enabled else apprise.Apprise()
+        if date_time_format not in DATE_TIME_FORMATS:
+            raise ValueError("Unsupported date and time format")
         async with self.sniffer_lock:
             config = {
                 PROTOCOL_CONFIG_KEYS[protocol]: str(enabled).lower()
@@ -221,14 +243,18 @@ class LanRadar:
             }
             config.update({
                 NEW_DEVICE_NOTIFICATIONS_ENABLED_CONFIG_KEY: str(bool(notifications_enabled)).lower(),
+                NOTIFICATION_NETWORK_NAME_CONFIG_KEY: notification_network_name,
                 APPRISE_URLS_CONFIG_KEY: normalized_urls,
+                DATE_TIME_FORMAT_CONFIG_KEY: date_time_format,
             })
             await database.set_config(config)
             changed_protocols = [protocol for protocol in PROTOCOL_FILTERS
                                  if self.protocol_enabled[protocol] != new_protocol_settings[protocol]]
             self.protocol_enabled.update(new_protocol_settings)
             self.new_device_notifications_enabled = bool(notifications_enabled)
+            self.notification_network_name = notification_network_name
             self.apprise_urls = normalized_urls
+            self.date_time_format = date_time_format
             self.notifier = new_notifier
             for protocol in changed_protocols:
                 self.packet_timestamps[protocol].clear()
@@ -248,7 +274,9 @@ class LanRadar:
         if not self.new_device_notifications_enabled:
             return
         task = asyncio.create_task(
-            self.send_new_device_notification(self.notifier, mac_addr, source, ip, hostname, vendor)
+            self.send_new_device_notification(
+                self.notifier, mac_addr, source, ip, hostname, vendor, self.notification_network_name
+            )
         )
         self.notification_tasks.add(task)
         task.add_done_callback(self.notification_tasks.discard)
@@ -261,6 +289,7 @@ class LanRadar:
             ip: str | None = None,
             hostname: str | None = None,
             vendor: str | None = None,
+            network_name: str = DEFAULT_NOTIFICATION_NETWORK_NAME,
     ):
         details = [f"MAC: {mac_addr}", f"Detected via: {source}"]
         if ip:
@@ -270,7 +299,7 @@ class LanRadar:
         if vendor:
             details.append(f"Vendor: {vendor}")
         try:
-            result = await notifier.async_notify(title="New device on the LAN", body="\n".join(details))
+            result = await notifier.async_notify(title=f"New device on {network_name}", body="\n".join(details))
         except Exception:
             logging.exception("Apprise notification failed")
         else:
@@ -442,6 +471,7 @@ class LanRadar:
         self.loop = asyncio.get_running_loop()
         await self.load_protocol_settings()
         await self.load_notification_settings()
+        await self.load_display_settings()
         async with self.sniffer_lock:
             self.start_sniffer()
         try:
@@ -458,6 +488,7 @@ async def index():
     def prepare_rows(rows):
         for row in rows:
             row["_edit_mode"] = edit_mode
+            row["_date_time_format"] = lan_radar.date_time_format
         return rows
 
     async def reload_rows():
@@ -656,7 +687,7 @@ async def index():
     timestamp_slot = """
         <q-td :props="props">
             {{ props.value
-                ? new Date(props.value * 1000).toLocaleString('en-US', {
+                ? new Date(props.value * 1000).toLocaleString(props.row._date_time_format || 'en-US', {
                     day: '2-digit', month: '2-digit', year: '2-digit',
                     hour: '2-digit', minute: '2-digit', hour12: false,
                 }).replace(',', '')
@@ -706,11 +737,16 @@ async def index():
                 protocol_settings,
                 new_device_notifications_switch.value,
                 apprise_urls_input.value or "",
+                notification_network_name_input.value or "",
+                date_time_format_select.value,
             )
         except Exception as exc:
             logging.exception("Could not save settings")
             ui.notify(f"Could not save settings: {exc}", type="negative", multi_line=True)
         else:
+            for row in table.rows:
+                row["_date_time_format"] = lan_radar.date_time_format
+            table.update()
             settings_dialog.close()
             ui.notify("Settings saved", type="positive")
 
@@ -718,7 +754,9 @@ async def index():
         for protocol, switch in settings_switches.items():
             switch.value = lan_radar.protocol_enabled[protocol]
         new_device_notifications_switch.value = lan_radar.new_device_notifications_enabled
+        notification_network_name_input.value = lan_radar.notification_network_name
         apprise_urls_input.value = lan_radar.apprise_urls
+        date_time_format_select.value = lan_radar.date_time_format
         settings_dialog.open()
 
     with ui.dialog() as settings_dialog, ui.card().classes("min-w-96"):
@@ -729,12 +767,24 @@ async def index():
         ui.separator()
         ui.label("Notifications").classes("text-h6")
         new_device_notifications_switch = ui.switch("Notify me about new devices")
+        notification_network_name_input = ui.input(
+            "Network name",
+            placeholder=DEFAULT_NOTIFICATION_NETWORK_NAME,
+        ).props("outlined").classes("w-full")
+        notification_network_name_input.bind_enabled_from(new_device_notifications_switch, "value")
         apprise_urls_input = ui.textarea(
             "Apprise URLs",
             placeholder="One destination URL per line",
         ).props("outlined autogrow").classes("w-full")
         apprise_urls_input.bind_enabled_from(new_device_notifications_switch, "value")
         ui.link("Supported notification services", "https://appriseit.com/services/", new_tab=True)
+        ui.separator()
+        ui.label("Display").classes("text-h6")
+        date_time_format_select = ui.select(
+            DATE_TIME_FORMATS,
+            value=lan_radar.date_time_format,
+            label="Date and time format",
+        ).props("outlined").classes("w-full")
         ui.separator()
         ui.label("Maintenance").classes("text-h6")
         ui.label("Refresh vendor data and update known devices.").classes("text-caption text-grey-5")

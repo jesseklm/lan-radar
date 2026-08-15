@@ -1,6 +1,6 @@
 [project]
 name = "lan-radar"
-version = "0.0.7"
+version = "0.0.8"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite==0.22.1",
