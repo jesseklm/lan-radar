@@ -1,5 +1,6 @@
 import logging
 import os
+import ssl
 
 from authlib.integrations.base_client import OAuthError
 from authlib.integrations.starlette_client import OAuth
@@ -23,6 +24,7 @@ if KEYCLOAK_ENABLED:
     if missing_variables:
         raise RuntimeError("Incomplete Keycloak configuration; missing environment variables: "
                            + ", ".join(missing_variables))
+KEYCLOAK_CUSTOM_CA_FILE = os.environ.get("KEYCLOAK_CUSTOM_CA_FILE", "")
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -39,12 +41,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 if KEYCLOAK_ENABLED:
     oauth = OAuth()
+    client_kwargs = {"scope": "openid profile email", "code_challenge_method": "S256"}
+    if KEYCLOAK_CUSTOM_CA_FILE:
+        ssl_ctx = ssl.create_default_context(cafile=KEYCLOAK_CUSTOM_CA_FILE)
+        ssl_ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        client_kwargs['verify'] = ssl_ctx
     oauth.register(
         name="keycloak",
         client_id=configuration["KEYCLOAK_CLIENT_ID"],
         client_secret=configuration["KEYCLOAK_CLIENT_SECRET"],
         server_metadata_url=f"{configuration['KEYCLOAK_BASE_URL']}/realms/{configuration['KEYCLOAK_REALM']}/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid profile email", "code_challenge_method": "S256"},
+        client_kwargs=client_kwargs,
     )
     app.add_middleware(AuthMiddleware)
 
