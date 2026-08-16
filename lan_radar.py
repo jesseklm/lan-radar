@@ -1,12 +1,9 @@
 import asyncio
 import inspect
 import ipaddress
-import json
 import logging
-import os
 import socket
 import time
-import urllib.request
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -22,12 +19,11 @@ from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.inet import IP, UDP
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import AsyncSniffer, send, sendp
-from starlette.responses import PlainTextResponse
 
 from database import database
+from home_assistant_ingress import HOME_ASSISTANT_INGRESS, get_ingress_port
+from keycloak_auth import KEYCLOAK_ENABLED, STORAGE_SECRET, get_username
 
-HOME_ASSISTANT_INGRESS = os.getenv("HOME_ASSISTANT_INGRESS", "").lower() in {"1", "true", "yes"}
-HOME_ASSISTANT_INGRESS_PROXY = "172.30.32.2"
 PACKET_COUNT_WINDOW_SECONDS = 60
 DEFAULT_TABLE_ROWS_PER_PAGE = 50
 TABLE_ROWS_PER_PAGE_CONFIG_KEY = "table.rows_per_page"
@@ -47,40 +43,6 @@ PROTOCOL_FILTERS = {
     "dns": "udp port 5353 and (udp[10] & 0x80 != 0)",
 }
 PROTOCOL_CONFIG_KEYS = {protocol: f"capture.{protocol}.enabled" for protocol in PROTOCOL_FILTERS}
-
-
-class HomeAssistantIngressMiddleware:
-    def __init__(self, application, enabled: bool):
-        self.application = application
-        self.enabled = enabled
-
-    async def __call__(self, scope, receive, send):
-        if not self.enabled or scope["type"] not in {"http", "websocket"}:
-            await self.application(scope, receive, send)
-            return
-
-        headers = list(scope.get("headers", []))
-        ingress_path = next((value for name, value in headers if name == b"x-ingress-path"), None)
-        client = scope.get("client")
-        if not ingress_path or not client or client[0] != HOME_ASSISTANT_INGRESS_PROXY:
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
-            else:
-                await PlainTextResponse("Forbidden", status_code=403)(scope, receive, send)
-            return
-
-        headers = [(name, value) for name, value in headers if name != b"x-forwarded-prefix"]
-        headers.append((b"x-forwarded-prefix", ingress_path.rstrip(b"/")))
-        scope["headers"] = headers
-        await self.application(scope, receive, send)
-
-
-def get_ingress_port() -> int:
-    token = os.environ["SUPERVISOR_TOKEN"]
-    request = urllib.request.Request("http://supervisor/addons/self/info", headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(request) as response:
-        result = json.load(response)
-    return result["data"]["ingress_port"]
 
 
 def get_network_interface() -> str:
@@ -803,6 +765,11 @@ async def index():
         edit_button = ui.button(icon="edit", on_click=toggle_edit_mode).props("flat dense")
         edit_button.tooltip("Toggle edit mode")
         ui.button(icon="settings", on_click=open_settings).props("flat dense").tooltip("Settings")
+        if KEYCLOAK_ENABLED:
+            username = get_username()
+            ui.button(icon="logout", on_click=lambda: ui.navigate.to("/logout")).props("flat dense").tooltip(
+                f"Sign out {username}" if username else "Sign out"
+            )
 
     with ui.dialog() as delete_device_dialog, ui.card():
         ui.label("Delete device").classes("text-h6")
@@ -827,7 +794,6 @@ if __name__ == "__main__":
 
     app.on_startup(startup)
     app.on_shutdown(database.close)
-    app.add_middleware(HomeAssistantIngressMiddleware, enabled=HOME_ASSISTANT_INGRESS)
     if HOME_ASSISTANT_INGRESS:
         host = "0.0.0.0"
         port = get_ingress_port()
@@ -843,6 +809,7 @@ if __name__ == "__main__":
             language="en-US",
             show=False,
             reload=False,
+            storage_secret=STORAGE_SECRET or None,
         )
     except KeyboardInterrupt:
         logging.info('KeyboardInterrupt received. Stopping.')
