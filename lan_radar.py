@@ -4,7 +4,6 @@ import ipaddress
 import logging
 import socket
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +24,7 @@ from home_assistant_ingress import HOME_ASSISTANT_INGRESS, get_ingress_port
 from keycloak_auth import KEYCLOAK_ENABLED, STORAGE_SECRET, get_username
 
 PACKET_COUNT_WINDOW_SECONDS = 60
+MAX_PACKET_TIMESTAMPS = 100_000
 DEFAULT_TABLE_ROWS_PER_PAGE = 50
 TABLE_ROWS_PER_PAGE_CONFIG_KEY = "table.rows_per_page"
 NEW_DEVICE_NOTIFICATIONS_ENABLED_CONFIG_KEY = "notifications.new_devices.enabled"
@@ -43,6 +43,30 @@ PROTOCOL_FILTERS = {
     "dns": "udp port 5353 and (udp[10] & 0x80 != 0)",
 }
 PROTOCOL_CONFIG_KEYS = {protocol: f"capture.{protocol}.enabled" for protocol in PROTOCOL_FILTERS}
+
+
+class PacketCounter:
+    def __init__(self, window_seconds: int = PACKET_COUNT_WINDOW_SECONDS):
+        self.window_seconds = window_seconds
+        self.counts = [0] * window_seconds
+        self.seconds = [-1] * window_seconds
+
+    def add(self, timestamp: float):
+        second = int(timestamp)
+        i = second % self.window_seconds
+        if self.seconds[i] != second:
+            self.seconds[i] = second
+            self.counts[i] = 0
+        self.counts[i] += 1
+
+    def count(self, now: float) -> int:
+        current_second = int(now)
+        cutoff = current_second - self.window_seconds
+        return sum(count for second, count in zip(self.seconds, self.counts) if second > cutoff)
+
+    def clear(self):
+        self.counts = [0] * self.window_seconds
+        self.seconds = [-1] * self.window_seconds
 
 
 def get_network_interface() -> str:
@@ -119,7 +143,7 @@ class LanRadar:
         self.sniffer = None
         self.sniffer_lock = asyncio.Lock()
         self.protocol_enabled = {protocol: True for protocol in PROTOCOL_FILTERS}
-        self.packet_timestamps = {protocol: deque() for protocol in PROTOCOL_FILTERS}
+        self.packet_counters = {protocol: PacketCounter() for protocol in PROTOCOL_FILTERS}
         self.new_device_notifications_enabled = False
         self.notification_network_name = DEFAULT_NOTIFICATION_NETWORK_NAME
         self.apprise_urls = ""
@@ -219,7 +243,7 @@ class LanRadar:
             self.date_time_format = date_time_format
             self.notifier = new_notifier
             for protocol in changed_protocols:
-                self.packet_timestamps[protocol].clear()
+                self.packet_counters[protocol].clear()
             if not changed_protocols:
                 return
             self.stop_sniffer()
@@ -285,17 +309,12 @@ class LanRadar:
         protocol = self.get_packet_protocol(packet)
         if protocol is None or not self.protocol_enabled[protocol]:
             return
-        self.packet_timestamps[protocol].append(received_at)
+        self.packet_counters[protocol].add(received_at)
         self.queue.put_nowait(packet)
 
     def get_packet_counts(self) -> dict[str, int]:
-        cutoff = time.monotonic() - PACKET_COUNT_WINDOW_SECONDS
-        counts = {}
-        for protocol, timestamps in self.packet_timestamps.items():
-            while timestamps and timestamps[0] <= cutoff:
-                timestamps.popleft()
-            counts[protocol] = len(timestamps)
-        return counts
+        now = time.monotonic()
+        return {protocol: counter.count(now) for protocol, counter in self.packet_counters.items()}
 
     def send_arp_discovery_sync(self):
         packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.subnet)
@@ -451,6 +470,7 @@ async def index():
         for row in rows:
             row["_edit_mode"] = edit_mode
             row["_date_time_format"] = lan_radar.date_time_format
+            row["_note_edit"] = row.get("note")
         return rows
 
     async def reload_rows():
@@ -463,13 +483,20 @@ async def index():
         return f"Vendor list updated; {updated} device {noun} changed"
 
     async def save_note(event):
+        mac = event.args["mac"]
+        note = event.args.get("note")
         try:
-            changed = await database.set_device_note(event.args["mac"], event.args.get("note"))
+            changed = await database.set_device_note(mac, note)
         except Exception as exc:
             logging.exception("Saving note failed")
             ui.notify(f"Saving note failed: {exc}", type="negative", multi_line=True)
         else:
             if changed:
+                for row in table.rows:
+                    if row["mac"] == mac:
+                        row["note"] = note
+                        row["_note_edit"] = note
+                        break
                 ui.notify("Note saved", type="positive")
 
     def request_device_deletion(event):
@@ -601,7 +628,7 @@ async def index():
         <q-td :props="props" style="max-width: 260px">
             <div v-if="props.row._edit_mode" class="row items-center no-wrap q-gutter-xs">
                 <q-input
-                    v-model="props.row.note"
+                    v-model="props.row._note_edit"
                     type="textarea"
                     autogrow
                     dense
@@ -615,7 +642,7 @@ async def index():
                     round
                     dense
                     color="primary"
-                    @click="$parent.$emit('note-change', {mac: props.row.mac, note: props.row.note})"
+                    @click="$parent.$emit('note-change', {mac: props.row.mac, note: props.row._note_edit})"
                 >
                     <q-tooltip>Save note</q-tooltip>
                 </q-btn>
