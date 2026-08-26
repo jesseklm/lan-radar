@@ -289,8 +289,20 @@ class LanRadar:
         except Exception:
             logging.exception("Apprise notification failed")
         else:
-            if result is not True:
+            if not result:
                 logging.error("Apprise notification could not be delivered")
+
+    @classmethod
+    async def send_test_notification(cls, apprise_urls: str) -> str:
+        normalized_urls = cls.normalize_apprise_urls(apprise_urls)
+        notifier = cls.create_notifier(normalized_urls)
+        result = await notifier.async_notify(
+            title="LAN Radar test notification",
+            body="Your Apprise notification settings are working.",
+        )
+        if not result:
+            raise RuntimeError("Test notification could not be delivered")
+        return "Test notification sent"
 
     def packet_received(self, packet):
         self.loop.call_soon_threadsafe(self.enqueue_packet, packet, time.monotonic())
@@ -766,6 +778,14 @@ async def index():
             placeholder="One destination URL per line",
         ).props("outlined autogrow").classes("w-full")
         apprise_urls_input.bind_enabled_from(new_device_notifications_switch, "value")
+        ui.button(
+            "Send test notification",
+            icon="send",
+            on_click=lambda: run_action(
+                "Test notification",
+                lambda: lan_radar.send_test_notification(apprise_urls_input.value or ""),
+            ),
+        ).props("outline").bind_enabled_from(new_device_notifications_switch, "value")
         ui.link("Supported notification services", "https://appriseit.com/services/", new_tab=True)
         ui.separator()
         ui.label("Display").classes("text-h6")
