@@ -2,8 +2,10 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import os
 import socket
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,9 @@ from scapy.sendrecv import AsyncSniffer, send, sendp
 from database import database
 from home_assistant_ingress import HOME_ASSISTANT_INGRESS, get_ingress_port
 from keycloak_auth import KEYCLOAK_ENABLED, STORAGE_SECRET, get_username
+
+with (Path(__file__).parent / "pyproject.toml").open("rb") as f:
+    __version__ = tomllib.load(f)["project"]["version"]
 
 PACKET_COUNT_WINDOW_SECONDS = 60
 MAX_PACKET_TIMESTAMPS = 100_000
@@ -70,6 +75,12 @@ class PacketCounter:
 
 
 def get_network_interface() -> str:
+    if interface := os.getenv("NETWORK_INTERFACE", "").strip():
+        try:
+            return network_name(interface)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid NETWORK_INTERFACE {interface!r}: {exc}") from exc
+
     conf.route.resync()
     default_interface, default_address, _ = conf.route.route()
     try:
@@ -828,7 +839,7 @@ async def index():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    logging.info('Starting LAN Radar.')
+    logging.info("Starting LAN Radar v%s.", __version__)
     mac = AsyncMacLookup()
     BaseMacLookup.cache_path = str(Path.cwd() / "mac-vendors.txt")
     lan_radar = LanRadar()
@@ -859,4 +870,4 @@ if __name__ == "__main__":
             storage_secret=STORAGE_SECRET or None,
         )
     except KeyboardInterrupt:
-        logging.info('KeyboardInterrupt received. Stopping.')
+        logging.info("KeyboardInterrupt received. Stopping.")
